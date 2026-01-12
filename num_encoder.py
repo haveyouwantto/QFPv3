@@ -140,18 +140,18 @@ def prefix_decode(f: io.IOBase) -> int:
 
 def encode_scale(scale):
     """将 float32 scale 转换为 8-bit uint8"""
-    if scale <= 1e-29: return 0 # 极小值归零
+    if scale <= 1e-14: return 0 # 极小值归零
     # 取 log2 并映射到 0-255
-    # 假设我们关心的范围是 -20 到 0 (2^-20 约等于 0.000001)
+    # 假设我们关心的范围是 -40 到 0 (2^-40 约等于 1e-14)
     log_s = np.log2(scale)
-    clipped_log = np.clip(log_s, -96, 0) 
-    quantized = np.round((clipped_log + 96) * (255 / 96))
+    clipped_log = np.clip(log_s, -40, 0) 
+    quantized = np.round((clipped_log + 40) * (255 / 40))
     return int(quantized)
 
 def decode_scale(q_scale):
     """将 8-bit uint8 还原为 float32 scale"""
-    if q_scale == 0: return 1e-29
-    log_s = (q_scale * (96 / 255)) - 96
+    if q_scale == 0: return 0
+    log_s = (q_scale * (40 / 255)) - 40
     return 2 ** log_s
 
 # --- 测试 ---

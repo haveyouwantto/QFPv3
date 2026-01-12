@@ -51,7 +51,7 @@ class QFP3Codec:
             else:
                 raise ValueError("Input audio must be mono or stereo (2 channels).")
         
-        #data = data[:sample_rate*15]  # 截取前30秒
+        data = data[:sample_rate*15]  # 截取前30秒
         hop_size = win_size // 2
         num_windows = (len(data) // hop_size) - 1
 
@@ -77,6 +77,61 @@ class QFP3Codec:
             window = create_mdct_window(win_size)
 
             io = BytesIO()
+
+            
+            band_plan =[]
+            num_bands = hop_size // group_size
+
+            for i in range(0, hop_size, group_size):
+                min_freq = int(i * nyquist / hop_size)
+                max_freq = int((i + group_size) * nyquist / hop_size)
+                if max_freq < 4000:
+                    quantizer_level = 0
+                    T = 0.2
+                elif max_freq < 8000:
+                    quantizer_level = 3
+                    T = 1
+                elif max_freq < 10000:
+                    quantizer_level = 5
+                    T = 6
+                elif max_freq < 12000:
+                    quantizer_level = 6
+                    T = 9
+                elif max_freq < 14000:
+                    quantizer_level = 7
+                    T = 13
+                elif max_freq < 18000:
+                    quantizer_level = 9
+                    T = 16
+                elif max_freq > 20000:
+                    quantizer_level = 15
+                else:
+                    quantizer_level = 9
+                    T = 19
+                band_plan.append(
+                    {
+                        "quantizer_level": quantizer_level,
+                        "T": T
+                    }
+                )
+
+            # 构造 L+R 的 Plan 数组
+            lpr_plan_arr = np.array([band['quantizer_level'] for band in band_plan], dtype=np.uint8)
+
+            # 构造 L-R 的 Plan 数组 (应用你逻辑中的 +3 偏移)
+            lmr_plan_arr = np.array([
+                np.clip(lvl + 3, 0, 9) if lvl < 9 else lvl 
+                for lvl in lpr_plan_arr
+            ], dtype=np.uint8)
+
+            quant_levels = [
+                lpr_plan_arr, lmr_plan_arr
+            ]
+
+            # 写入两个 Plan (每个 4-bit 打包)
+            f.write(float_pack(4, lpr_plan_arr))
+            f.write(float_pack(4, lmr_plan_arr))
+                            
             
             for i in tqdm(range(num_windows), desc="压缩进度"):
             
@@ -90,44 +145,20 @@ class QFP3Codec:
                 frame_bytes = bytearray()
 
                 quantizers = {}
+                silent = True
 
                 # 2. MDCT 变换
                 for ch, block in enumerate([LPR, LMR]):
                     mdct_coeff = mdct(block) / win_size
 
-                    band_plan = np.zeros(hop_size // group_size, dtype=np.uint8)
                     bands = []
 
-                    for i in range(0, hop_size, group_size):
-                        min_freq = int(i * nyquist / hop_size)
-                        max_freq = int((i + group_size) * nyquist / hop_size)
-                        if max_freq < 4000:
-                            quantizer_level = 0
-                            T = 0.2
-                        elif max_freq < 8000:
-                            quantizer_level = 3
-                            T = 1
-                        elif max_freq < 10000:
-                            quantizer_level = 5
-                            T = 6
-                        elif max_freq < 12000:
-                            quantizer_level = 6
-                            T = 9
-                        elif max_freq < 14000:
-                            quantizer_level = 7
-                            T = 13
-                        elif max_freq < 18000:
-                            quantizer_level = 9
-                            T = 16
-                        elif max_freq > 20000:
-                            quantizer_level = 15
-                        else:
-                            quantizer_level = 9
-                            T = 19
+                    band_bitmap=np.zeros(num_bands, dtype=np.uint8)
 
-                        if ch == 1 and quantizer_level < 9:
-                            quantizer_level = np.clip(quantizer_level + 3, 0, 9)
-                            
+                    for i in range(0, hop_size, group_size):
+                        band_idx = i // group_size
+                        quantizer_level = quant_levels[ch][band_idx]
+                        T = band_plan[band_idx]['T']
 
                         scale = np.max(np.abs(mdct_coeff[i:i+group_size]))
                         if scale == 0:
@@ -140,14 +171,12 @@ class QFP3Codec:
 
                         quantizer = QUANT_LEVELS[quantizer_level]['plan']
                         if quantizer is None:
-                            band_plan[i // group_size] = quantizer_level
                             continue
                         quantized = quantizer.quantize(mdct_coeff[i:i+group_size])
 
                         # 检测是否全0
                         if np.all(quantized == 0):
-                            quantizer_level = 15
-                            band_plan[i // group_size] = quantizer_level
+                            continue
                         else:
 
                             pos = pos_encode(quantized, min_length=3*8//quantizer.plan.bits)
@@ -166,7 +195,8 @@ class QFP3Codec:
                                 stripped = np.concatenate([stripped, np.zeros(padding_size, dtype=np.uint8)])
 
                             result = float_pack(quantizer.plan.bits, stripped)
-                            band_plan[i // group_size] = quantizer_level
+                            band_bitmap[band_idx] = 1
+                            silent = False
                             band = {
                                 "scale": scale,
                                 "pos_bytes": pos_bytes,
@@ -174,11 +204,14 @@ class QFP3Codec:
                             }
                             bands.append(band)
 
-                    print(band_plan)
-                    band_plan_packed = float_pack(4, band_plan)
-                    frame_bytes.extend(band_plan_packed)
+                    # Write band bitmap
+                    bitmap = np.packbits(band_bitmap)
+                    print(bitmap)
+                    frame_bytes.extend(bitmap.tobytes())
 
-                    for band in bands:
+                    for band_idx, band in enumerate(bands):
+                        if band_bitmap[band_idx] == 0:
+                            continue
                         q_s = encode_scale(band['scale'])
                         frame_bytes.append(q_s) # 直接 append 一个 byte
                         frame_bytes.extend(prefix_encode(len(band['pos_bytes'])))
@@ -186,8 +219,8 @@ class QFP3Codec:
                         frame_bytes.extend(prefix_encode(len(band['result'])))
                         frame_bytes.extend(band['result'])
 
-                # 如果band plan全是15，说明这一帧全是静音，直接跳过
-                if np.all(band_plan == 15):
+                # 全是静音，直接跳过
+                if silent:
                     io.write(encapsulate_frame(b''))
                     continue
 
@@ -221,8 +254,17 @@ class QFP3Codec:
             hop_size = win_size // 2
             window = create_mdct_window(win_size)
             nyquist = sample_rate // 2
+
+            num_bands = hop_size // group_size
+            plan_bytes_per_ch = (num_bands + 1) // 2
+
+            # 依次读取两个通道的 Plan   
+            lpr_plan = float_unpack(4, f.read(plan_bytes_per_ch), num_bands)
+            lmr_plan = float_unpack(4, f.read(plan_bytes_per_ch), num_bands)
+            dual_ch_plans = [lpr_plan, lmr_plan] # 放入列表方便循环调用
             
             recon_audio = []
+            
 
             out_buffer = np.zeros((2, hop_size*3), dtype=np.float32)
             print(f"读取压缩数据 (版本 {version}, 采样率 {sample_rate}, 窗口大小 {win_size}, 窗口数 {num_windows})")
@@ -236,13 +278,13 @@ class QFP3Codec:
             with open('out.dump', 'wb') as f:
                 f.write(data)
 
-            num_bands = hop_size // group_size
 
             br_diagnosis = {
                 "band_plan": 0,
                 "pos_bytes": 0,
                 "result": 0
             }
+
             
             for _ in tqdm(range(num_windows), desc="解压进度"): 
                 
@@ -257,15 +299,18 @@ class QFP3Codec:
                 for i in range(2):
 
                     mdct_coeff = np.zeros(hop_size+group_size)
-
-                    band_plan = float_unpack(4, frame.read(num_bands // 2), num_bands)
                     br_diagnosis["band_plan"] += num_bands // 2
+
+                    bitmap_size = np.ceil(num_bands / 8)
+                    band_bitmap = np.frombuffer(frame.read(int(bitmap_size)), dtype=np.uint8)
+                    band_bitmap = np.unpackbits(band_bitmap)
 
 
                     for j in range(0, hop_size, group_size):
-                        quantizer_level = band_plan[j // group_size]
-                        if quantizer_level == 15:
+                        band_idx = j // group_size
+                        if band_bitmap[band_idx] == 0:
                             continue
+                        quantizer_level = dual_ch_plans[i][band_idx]
                         q_s = frame.read(1)[0]
                         scale = decode_scale(q_s)
                         pos_length = prefix_decode(frame)
@@ -278,9 +323,10 @@ class QFP3Codec:
                         
                         quantizer = QUANT_LEVELS[quantizer_level]['plan']
                         stripped = float_unpack(quantizer.plan.bits, quantized, length * 8 // quantizer.plan.bits)
-                        # print(length, quantized)
+                        
                         quantized = np.array(pos_decode(pos, stripped, group_size))[:group_size]
                         mdct_coeff[j:j+group_size] = quantizer.dequantize(quantized) * scale
+                        print(quantized)
 
                     recon[i] = imdct(mdct_coeff[:hop_size] * win_size) * window
 
