@@ -26,6 +26,9 @@ QUANT_LEVELS = {
     15: {'bits': 0, 'plan': None}
 }
 
+def warp_steep(x, k=2):
+    return (x**k) / (x**k + (1-x)**k)
+
 class QFP3Codec:
     def __init__(self):
         self.version = 3
@@ -43,7 +46,7 @@ class QFP3Codec:
         # 强制立体声转换与填充
         if len(data.shape) == 1:
             data = np.column_stack((data, data))
-        data = data[:sample_rate * 15] # 截取 15 秒
+        data = data[sample_rate * 30:sample_rate * 45] # 截取 15 秒
         if len(data) % win_size != 0:
             padding_size = win_size - (len(data) % win_size)
             data = np.pad(data, ((0, padding_size), (0, 0)), mode='constant')
@@ -55,16 +58,20 @@ class QFP3Codec:
         band_plan = []
         for i in range(0, hop_size, group_size):
             max_freq = int((i + group_size) * nyquist / hop_size)
-            # 根据频率设定量化级别与死区阈值 T
-            if max_freq < 4000:   quantizer_level, T = 0, 0.2
-            elif max_freq < 8000: quantizer_level, T = 3, 1
-            elif max_freq < 10000: quantizer_level, T = 5, 6
-            elif max_freq < 12000: quantizer_level, T = 6, 9
-            elif max_freq < 14000: quantizer_level, T = 7, 13
-            elif max_freq < 18000: quantizer_level, T = 9, 16
-            elif max_freq > 20000: quantizer_level, T = 15, 0
-            else:                  quantizer_level, T = 9, 19
-            band_plan.append({"quantizer_level": quantizer_level, "T": T})
+            # 设定基础保留比例：低频几乎全保，高频大幅削减
+            if max_freq < 4000:    quantizer_level, kr_base = 0, 4
+            elif max_freq < 6000:  quantizer_level, kr_base = 3, 1
+            elif max_freq < 8000:  quantizer_level, kr_base = 5, 1/2
+            elif max_freq < 10000: quantizer_level, kr_base = 6, 1/4
+            elif max_freq < 12000: quantizer_level, kr_base = 7, 1/8
+            elif max_freq < 14000: quantizer_level, kr_base = 8, 1/16
+            elif max_freq < 16000: quantizer_level, kr_base = 9, 1/32
+            elif max_freq < 18000: quantizer_level, kr_base = 9, 1/64
+            elif max_freq > 20000: quantizer_level, kr_base = 15, 0.0
+            else:                  quantizer_level, kr_base = 9, 1/128
+            
+            band_plan.append({"quantizer_level": quantizer_level, "kr_base": kr_base})
+            
 
         # --- 步骤 3: 构造并保存双通道静态 Plan ---
         lpr_plan_arr = np.array([b['quantizer_level'] for b in band_plan], dtype=np.uint8)
@@ -85,6 +92,14 @@ class QFP3Codec:
                 L = data[i * hop_size : i * hop_size + win_size, 0]
                 R = data[i * hop_size : i * hop_size + win_size, 1]
                 LPR, LMR = (L + R) * window, (L - R) * window
+
+                # 计算 L+R 和 L-R 的总能量 (或者用绝对值之和)
+                energy_lpr = np.sum(np.abs(LPR))
+                energy_lmr = np.sum(np.abs(LMR))
+
+                # 计算差异系数 (0.0 ~ 1.0)
+                # 如果 energy_lpr 很大而 energy_lmr 很小，ms_ratio 会接近 0
+                ms_ratio = energy_lmr / (energy_lpr + 1e-6)
                 
                 frame_bytes = bytearray()
                 silent = True
@@ -97,20 +112,48 @@ class QFP3Codec:
                     for b_idx in range(num_bands):
                         start = b_idx * group_size
                         q_lvl = quant_levels_cache[ch][b_idx]
-                        T_val = band_plan[b_idx]['T']
+                        q_bits = QUANT_LEVELS[q_lvl]['bits']
+
+                        if q_lvl == 15: continue
                         
-                        # 归一化与死区裁剪
+                        # 归一化
                         block_data = mdct_coeff[start:start+group_size]
                         scale = np.max(np.abs(block_data)) if np.max(np.abs(block_data)) > 0 else 1
                         norm_data = block_data / scale
-                        threshold = (qp / 63) * 0.1 * T_val
-                        norm_data = np.where(np.abs(norm_data) < threshold, 0, norm_data)
+
+                        # 比特削减
+
+                        # 1. 收集当前通道所有 MDCT 系数的绝对值
+                        all_coeffs = np.abs(norm_data)
+
+                        # 2. 设定你的保留比例 (例如根据 QP 计算 ratio)
+                        bit_bouns = (8 / q_bits)
+                        channel_bouns = 1 if ch == 0 else np.clip(ms_ratio * 1.5, 0.1, 0.5)
+                        keep_ratio = np.clip(
+                            max(0, warp_steep(1.0 - (qp / 63), 1.5)) * band_plan[b_idx]['kr_base'] * bit_bouns * channel_bouns,
+                            0,1
+                        )
+                        if keep_ratio < 1 / group_size:
+                            # 设置为全0
+                            pruned_data = np.zeros_like(norm_data)
+                        else:
+                            # 3. 找到截断阈值
+                            # 使用 np.percentile 快速找到对应比例的阈值
+                            threshold_val = np.percentile(all_coeffs, (1 - keep_ratio) * 100)
+
+                            # 4. 执行“暴力”抹除
+                            pruned_data = np.where(np.abs(norm_data) < threshold_val, 0, norm_data)
 
                         quantizer = QUANT_LEVELS[q_lvl]['plan']
                         if quantizer is None: continue
                         
-                        quantized = quantizer.quantize(norm_data)
-                        if np.all(quantized == 0): continue
+                        quantized = quantizer.quantize(pruned_data)
+
+                        # 损失能量计算
+                        restored = quantizer.dequantize(quantized)
+
+                        amp_loss = max(0, np.sum(np.abs(norm_data)) - np.sum(np.abs(restored)))
+                        loss_byte = int(np.clip(amp_loss * 4, 0, 255))
                         
                         # 位置编码与位对齐打包
                         pos_info = pos_encode(quantized, min_length=3*8//quantizer.plan.bits)
@@ -126,7 +169,8 @@ class QFP3Codec:
                         bands_data.append({
                             "scale": scale,
                             "pos_bytes": encode_pos_arr(pos_info['pos']),
-                            "result": float_pack(quantizer.plan.bits, stripped)
+                            "result": float_pack(quantizer.plan.bits, stripped),
+                            "loss_byte": loss_byte
                         })
 
                     # 写入通道 Bitmap
@@ -134,6 +178,7 @@ class QFP3Codec:
                     # 写入通道各 Band 详细数据
                     for b in bands_data:
                         frame_bytes.append(encode_scale(b['scale']))
+                        frame_bytes.append(b['loss_byte']) # 写入 1 字节
                         frame_bytes.extend(prefix_encode(len(b['pos_bytes'])) + b['pos_bytes'])
                         frame_bytes.extend(prefix_encode(len(b['result'])) + b['result'])
 
@@ -182,6 +227,8 @@ class QFP3Codec:
                     mdct_coeff = np.zeros(hop_size)
                     bitmap_size = int(np.ceil(num_bands / 8))
                     band_bitmap = np.unpackbits(np.frombuffer(frame.read(bitmap_size), dtype=np.uint8))
+                    amp_losses = np.zeros(num_bands) # 用于存放该帧各 Band 的 loss
+                    scales = np.zeros(num_bands)     # 存放 scale 用于还原绝对 loss
 
                     for j in range(0, hop_size, group_size):
                         band_idx = j // group_size
@@ -190,6 +237,10 @@ class QFP3Codec:
                         # 依照 Plan 恢复量化器
                         q_lvl = dual_ch_plans[i][band_idx]
                         scale = decode_scale(frame.read(1)[0])
+
+                        loss_val = frame.read(1)[0] / 4.0 # 还原 amp_loss_norm
+                        scales[band_idx] = scale
+                        amp_losses[band_idx] = loss_val * scale # 转换为绝对幅度损失
                         
                         # 恢复位置与 stripped 数据
                         pos_len = prefix_decode(frame)
@@ -204,6 +255,39 @@ class QFP3Codec:
                         # 反量化并恢复 Band
                         quantized = np.array(pos_decode(pos, stripped, group_size))[:group_size]
                         mdct_coeff[j:j+group_size] = quantizer.dequantize(quantized) * scale
+
+                    # 第二次遍历：执行噪声填充 (仿照 v2 的插值逻辑)
+                    if np.sum(amp_losses) > 0:
+                        # 构建插值点：每个 Band 的中心
+                        x_old = np.arange(group_size // 2, hop_size, group_size)
+                        # 获取有效的 loss 点（有数据的 band）
+                        # 这里为了简单处理，全频段插值，无数据频段 loss 为 0
+                        from scipy.interpolate import interp1d
+                        
+                        # 为防止边界突变，在两头补 0
+                        x_points = np.concatenate([[-group_size], x_old, [hop_size + group_size]])
+                        y_points = np.concatenate([[0], amp_losses, [0]])
+                        
+                        f_interp = interp1d(x_points, y_points, kind='linear')
+                        # 生成全频段的噪声增益包络
+                        noise_envelope = f_interp(np.arange(hop_size))
+                        
+                        # 生成原始噪声 (标准正态分布)
+                        # 注意：sum(abs(noise)) 对于 group_size=64 约等于 64 * 0.8 = 51.2
+                        # 我们需要根据 noise_envelope 控制这个 sum(abs)
+                        raw_noise = np.random.normal(0, 1.0, hop_size)
+                        
+                        # 归一化每一组噪声，使其 sum(abs) 精确等于要求的 loss
+                        for b_idx in range(num_bands):
+                            idx_range = slice(b_idx * group_size, (b_idx + 1) * group_size)
+                            curr_noise = raw_noise[idx_range]
+                            curr_sum = np.sum(np.abs(curr_noise))
+                            if curr_sum > 0:
+                                # 将噪声注入到原系数为 0 的缝隙中
+                                zero_mask = (mdct_coeff[idx_range] == 0)
+                                # 强度调节：根据插值包络
+                                target_amp = noise_envelope[idx_range] 
+                                mdct_coeff[idx_range] += (curr_noise / curr_sum) * target_amp * zero_mask
 
                     ch_recon[i] = imdct(mdct_coeff * win_size) * window
 
@@ -230,5 +314,5 @@ class QFP3Codec:
 
 if __name__ == "__main__":
     encoder = QFP3Codec()
-    encoder.compress("music.flac", "test.qfp")
+    encoder.compress("music.flac", "test.qfp", qp=52)
     encoder.decompress("test.qfp", "result.wav")
