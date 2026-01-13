@@ -104,10 +104,14 @@ class QFP3Codec:
                 frame_bytes = bytearray()
                 silent = True
 
+                quantize_bits = [8,6,4,2]
+
                 for ch, block in enumerate([LPR, LMR]):
                     mdct_coeff = mdct(block) / win_size
                     bands_data = []
                     band_bitmap = np.zeros(num_bands, dtype=np.uint8)
+
+                    mdct_buckets = {8: [], 6: [], 4: [], 2: []}
 
                     for b_idx in range(num_bands):
                         start = b_idx * group_size
@@ -154,40 +158,43 @@ class QFP3Codec:
 
                         amp_loss = max(0, np.sum(np.abs(norm_data)) - np.sum(np.abs(restored)))
                         loss_byte = int(np.clip(amp_loss * 4, 0, 255))
-                        
-                        # 位置编码与位对齐打包
-                        pos_info = pos_encode(quantized, min_length=3*8//quantizer.plan.bits)
-                        stripped = np.array(pos_info['stripped'])
-                        
-                        align = {8: 1, 6: 4, 4: 2, 2: 4, 1: 8}.get(quantizer.plan.bits, 1)
-                        if len(stripped) % align != 0:
-                            stripped = np.concatenate([stripped, np.zeros(align - (len(stripped) % align), dtype=np.uint8)])
 
                         # 记录 Band 数据
                         band_bitmap[b_idx] = 1
                         silent = False
                         bands_data.append({
                             "scale": scale,
-                            "pos_bytes": encode_pos_arr(pos_info['pos']),
-                            "result": float_pack(quantizer.plan.bits, stripped),
                             "loss_byte": loss_byte
                         })
+                        mdct_buckets[quantizer.plan.bits].extend(quantized)
 
                     # 写入通道 Bitmap
                     frame_bytes.extend(np.packbits(band_bitmap).tobytes())
-                    # 写入通道各 Band 详细数据
+                    # 写入通道各 Band 元数据
                     for b in bands_data:
                         frame_bytes.append(encode_scale(b['scale']))
                         frame_bytes.append(b['loss_byte']) # 写入 1 字节
-                        frame_bytes.extend(prefix_encode(len(b['pos_bytes'])) + b['pos_bytes'])
-                        frame_bytes.extend(prefix_encode(len(b['result'])) + b['result'])
+                        
+                    # 写入 MDCT 系数桶
+                    for bits in quantize_bits:
+                        bucket = mdct_buckets[bits]
+                        pos_info = pos_encode(bucket, min_length=3*8//bits)
+                        pos_bytes = encode_pos_arr(pos_info['pos'])
+                        stripped = np.array(pos_info['stripped'])
+                        align = {8: 1, 6: 4, 4: 2, 2: 4, 1: 8}.get(bits, 1)
+                        if len(stripped) % align != 0:
+                            stripped = np.concatenate([stripped, np.zeros(align - (len(stripped) % align), dtype=np.uint8)])
+                        result = float_pack(bits, stripped)
+                        frame_bytes.extend(prefix_encode(len(pos_bytes)) + pos_bytes)
+                        frame_bytes.extend(prefix_encode(len(result)) + result)
 
                 # 封装帧并计算 CRC
                 if silent:
                     io.write(encapsulate_frame(b''))
                 else:
-                    frame_bytes.extend(struct.pack("<H", crc16(bytes(frame_bytes))))
-                    io.write(encapsulate_frame(frame_bytes))
+                    crc = crc16(bytes(frame_bytes))
+                    # 放在最前面
+                    io.write(encapsulate_frame(struct.pack("<H", crc) + frame_bytes))
 
             # zlib 终极压缩
             f.write(zlib.compress(io.getvalue()))
@@ -208,6 +215,8 @@ class QFP3Codec:
             dual_ch_plans = [lpr_plan, lmr_plan]
             
             data = zlib.decompress(f.read())
+            with open("out.dump", "wb") as g:
+                g.write(data)
             io = BytesIO(data)
             window = create_mdct_window(win_size)
             recon_audio = []
@@ -222,39 +231,75 @@ class QFP3Codec:
                 
                 frame = BytesIO(frame_bytes)
                 ch_recon = np.zeros((2, win_size), dtype=np.float32)
+
+                # CRC 校验
+                crc_stored = struct.unpack("<H", frame.read(2))[0]
+                if crc16(frame_bytes[2:]) != crc_stored:
+                    raise ValueError("CRC check failed")
                 
-                for i in range(2):
+                for i in range(2): # 通道循环
                     mdct_coeff = np.zeros(hop_size)
                     bitmap_size = int(np.ceil(num_bands / 8))
-                    band_bitmap = np.unpackbits(np.frombuffer(frame.read(bitmap_size), dtype=np.uint8))
-                    amp_losses = np.zeros(num_bands) # 用于存放该帧各 Band 的 loss
-                    scales = np.zeros(num_bands)     # 存放 scale 用于还原绝对 loss
-
-                    for j in range(0, hop_size, group_size):
-                        band_idx = j // group_size
-                        if band_bitmap[band_idx] == 0: continue
-                        
-                        # 依照 Plan 恢复量化器
-                        q_lvl = dual_ch_plans[i][band_idx]
-                        scale = decode_scale(frame.read(1)[0])
-
-                        loss_val = frame.read(1)[0] / 4.0 # 还原 amp_loss_norm
-                        scales[band_idx] = scale
-                        amp_losses[band_idx] = loss_val * scale # 转换为绝对幅度损失
-                        
-                        # 恢复位置与 stripped 数据
+                    band_bitmap = np.unpackbits(np.frombuffer(frame.read(bitmap_size), dtype=np.uint8))[:num_bands]
+                    
+                    # 1. 预读本通道所有 Band 的元数据 (Scale, Loss)
+                    # 因为压缩时是按 band 顺序写的，所以这里也按顺序读
+                    band_meta = []
+                    for b_idx in range(num_bands):
+                        if band_bitmap[b_idx] == 1:
+                            scale = decode_scale(frame.read(1)[0])
+                            loss_val = frame.read(1)[0] / 4.0
+                            band_meta.append((scale, loss_val))
+                    
+                    # 2. 预读并恢复本通道的 4 个比特桶
+                    # 每个桶恢复成一个大的一维 quantized 数组
+                    buckets_quantized = {8: [], 6: [], 4: [], 2: []}
+                    for bits in [8, 6, 4, 2]:
                         pos_len = prefix_decode(frame)
+                        
                         pos = decode_pos_arr(BytesIO(frame.read(pos_len)))
                         res_len = prefix_decode(frame)
                         quant_data = frame.read(res_len)
+                        if pos_len == 0: continue # 该比特等级无数据
                         
-                        quantizer = QUANT_LEVELS[q_lvl]['plan']
-                        bits = quantizer.plan.bits
-                        stripped = float_unpack(bits, quant_data, res_len * 8 // bits)
+                        # 难点：我们需要知道这个桶对应了多少个 Band，从而确定 total_length
+                        # 统计本通道 bitmap 中，属于当前 bits 等级的 Band 数量
+                        active_bands_count = 0
+                        for b_idx in range(num_bands):
+                            if band_bitmap[b_idx] == 1 and QUANT_LEVELS[dual_ch_plans[i][b_idx]]['bits'] == bits:
+                                active_bands_count += 1
+
+                        # 计算该桶中有多少个有效系数 (通过 pos 推断)
+                        stripped = float_unpack(bits, quant_data, active_bands_count * group_size)
                         
-                        # 反量化并恢复 Band
-                        quantized = np.array(pos_decode(pos, stripped, group_size))[:group_size]
-                        mdct_coeff[j:j+group_size] = quantizer.dequantize(quantized) * scale
+                        # 恢复出该桶完整的 quantized 序列
+                        full_bucket = pos_decode(pos, stripped, active_bands_count * group_size)
+                        buckets_quantized[bits] = np.array(full_bucket, dtype=np.uint8)
+
+                    # 3. 分配数据：再次遍历 Band，从桶中“截稿”
+                    meta_ptr = 0
+                    bucket_ptrs = {8: 0, 6: 0, 4: 0, 2: 0} # 这里的指针以系数个数为单位
+                    
+                    amp_losses = np.zeros(num_bands)
+                    
+                    for b_idx in range(num_bands):
+                        if band_bitmap[b_idx] == 0: continue
+                        
+                        q_bits = QUANT_LEVELS[dual_ch_plans[i][b_idx]]['bits']
+                        scale, loss_norm = band_meta[meta_ptr]
+                        meta_ptr += 1
+                        
+                        # 从对应 bits 的桶中截取 group_size 个系数
+                        start_p = bucket_ptrs[q_bits]
+                        end_p = start_p + group_size
+                        q_slice = buckets_quantized[q_bits][start_p:end_p]
+                        bucket_ptrs[q_bits] = end_p
+                        if len(q_slice) == 0: continue
+                        
+                        # 反量化
+                        quantizer = QUANT_LEVELS[dual_ch_plans[i][b_idx]]['plan']
+                        mdct_coeff[b_idx*group_size : (b_idx+1)*group_size] = quantizer.dequantize(q_slice) * scale
+                        amp_losses[b_idx] = loss_norm * scale
 
                     # 第二次遍历：执行噪声填充 (仿照 v2 的插值逻辑)
                     if np.sum(amp_losses) > 0:
@@ -290,11 +335,6 @@ class QFP3Codec:
                                 mdct_coeff[idx_range] += (curr_noise / curr_sum) * target_amp * zero_mask
 
                     ch_recon[i] = imdct(mdct_coeff * win_size) * window
-
-                # CRC 校验
-                crc_stored = struct.unpack("<H", frame.read(2))[0]
-                if crc16(frame_bytes[:-2]) != crc_stored:
-                    raise ValueError("CRC check failed")
 
                 # --- 步骤 7: L+R / L-R 还原与重叠相加 (OLA) ---
                 LPR, LMR = ch_recon
