@@ -46,7 +46,7 @@ class QFP3Codec:
         # 强制立体声转换与填充
         if len(data.shape) == 1:
             data = np.column_stack((data, data))
-        data = data[sample_rate * 30:sample_rate * 45] # 截取 15 秒
+        data = data[sample_rate * 8:sample_rate * 16] # 截取 15 秒
         if len(data) % win_size != 0:
             padding_size = win_size - (len(data) % win_size)
             data = np.pad(data, ((0, padding_size), (0, 0)), mode='constant')
@@ -59,7 +59,7 @@ class QFP3Codec:
         for i in range(0, hop_size, group_size):
             max_freq = int((i + group_size) * nyquist / hop_size)
             # 设定基础保留比例：低频几乎全保，高频大幅削减
-            if max_freq < 4000:    quantizer_level, kr_base = 0, 4
+            if max_freq < 4000:    quantizer_level, kr_base = 0, 2
             elif max_freq < 6000:  quantizer_level, kr_base = 3, 1
             elif max_freq < 8000:  quantizer_level, kr_base = 5, 1/2
             elif max_freq < 10000: quantizer_level, kr_base = 6, 1/4
@@ -112,6 +112,7 @@ class QFP3Codec:
                     band_bitmap = np.zeros(num_bands, dtype=np.uint8)
 
                     mdct_buckets = {8: [], 6: [], 4: [], 2: []}
+                    # print("="*40)
 
                     for b_idx in range(num_bands):
                         start = b_idx * group_size
@@ -135,18 +136,19 @@ class QFP3Codec:
                         channel_bouns = 1 if ch == 0 else np.clip(ms_ratio * 1.5, 0.1, 0.5)
                         keep_ratio = np.clip(
                             max(0, warp_steep(1.0 - (qp / 63), 1.5)) * band_plan[b_idx]['kr_base'] * bit_bouns * channel_bouns,
-                            0,1
+                            0,0.99
                         )
-                        if keep_ratio < 1 / group_size:
-                            # 设置为全0
-                            pruned_data = np.zeros_like(norm_data)
-                        else:
-                            # 3. 找到截断阈值
-                            # 使用 np.percentile 快速找到对应比例的阈值
-                            threshold_val = np.percentile(all_coeffs, (1 - keep_ratio) * 100)
+                        # # print(keep_ratio)
+                        # if keep_ratio < 1 / group_size:
+                        #     # 设置为全0
+                        #     pruned_data = np.zeros_like(norm_data)
+                        # else:
+                        # 3. 找到截断阈值
+                        # 使用 np.percentile 快速找到对应比例的阈值
+                        threshold_val = np.percentile(all_coeffs, (1 - keep_ratio) * 100)
 
-                            # 4. 执行“暴力”抹除
-                            pruned_data = np.where(np.abs(norm_data) < threshold_val, 0, norm_data)
+                        # 4. 执行“暴力”抹除
+                        pruned_data = np.where(np.abs(norm_data) < threshold_val, 0, norm_data)
 
                         quantizer = QUANT_LEVELS[q_lvl]['plan']
                         if quantizer is None: continue
@@ -260,7 +262,7 @@ class QFP3Codec:
                         pos = decode_pos_arr(BytesIO(frame.read(pos_len)))
                         res_len = prefix_decode(frame)
                         quant_data = frame.read(res_len)
-                        if pos_len == 0: continue # 该比特等级无数据
+                        if res_len == 0: continue # 该比特等级无数据
                         
                         # 难点：我们需要知道这个桶对应了多少个 Band，从而确定 total_length
                         # 统计本通道 bitmap 中，属于当前 bits 等级的 Band 数量
@@ -269,8 +271,8 @@ class QFP3Codec:
                             if band_bitmap[b_idx] == 1 and QUANT_LEVELS[dual_ch_plans[i][b_idx]]['bits'] == bits:
                                 active_bands_count += 1
 
-                        # 计算该桶中有多少个有效系数 (通过 pos 推断)
-                        stripped = float_unpack(bits, quant_data, active_bands_count * group_size)
+                        # 计算该桶中有多少个有效系数
+                        stripped = float_unpack(bits, quant_data, len(quant_data) * 8 // bits)
                         
                         # 恢复出该桶完整的 quantized 序列
                         full_bucket = pos_decode(pos, stripped, active_bands_count * group_size)
@@ -354,5 +356,5 @@ class QFP3Codec:
 
 if __name__ == "__main__":
     encoder = QFP3Codec()
-    encoder.compress("music.flac", "test.qfp", qp=52)
+    encoder.compress("寂れた浜辺(Deserted beach).wav", "test.qfp", qp=52)
     encoder.decompress("test.qfp", "result.wav")
