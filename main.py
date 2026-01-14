@@ -196,7 +196,7 @@ class QFP3Codec:
             data = np.column_stack((data, data))
         
         # 截取音频 (当前仅处理前 15 秒,可根据需要调整)
-        data = data[sample_rate * 0:sample_rate * 15]
+        # data = data[sample_rate * 0:sample_rate * 15]
         
         # 填充音频至窗口大小的整数倍
         # 这样可以确保所有音频数据都能被完整处理
