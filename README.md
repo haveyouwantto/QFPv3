@@ -337,15 +337,6 @@ python num_encoder.py
 
 解压时会生成 `out.dump` 文件，包含 Zlib 解压后的原始帧数据，可用于调试。
 
-### 可视化
-
-项目包含多个 PNG 文件用于算法验证：
-- `before.png` / `after.png`: 压缩前后频谱对比
-- `after_filling.png`: 噪声填充效果
-- `gt.png`: Ground Truth 参考
-
----
-
 ## 📚 相关资源
 
 ### 参考资料
