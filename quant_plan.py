@@ -222,43 +222,36 @@ class FloatQuantizer(Quantizer):
         scale = normalized_range / self.plan.max_value if self.plan.max_value > 0 else 1.0
         return val * scale
 
-
 class Int2BitSpecialQuantizer:
     def __init__(self, plan=None):
-        self.plan = plan # 保持接口兼容
+        self.plan = plan
         self.bits = 2
         
     def quantize(self, x: np.ndarray) -> np.ndarray:
-        """输入 x 范围 [-1.0, 1.0]"""
         out = np.zeros_like(x, dtype=np.uint8)
+        abs_x = np.abs(x)
         
-        # 定义死区，绝对值小于 0.1 统统归零
-        zero_mask = np.abs(x) < 0.1
+        # 1. 定义统一的死区
+        zero_mask = abs_x < 0.1
         
-        # 处理正数
-        pos_mask = (~zero_mask) & (x > 0)
-        # 0.1 ~ 0.5946 映射为 1
-        out[pos_mask & (x <= 0.5946)] = 1
-        # > 0.5946 映射为 2 (1.0)
-        out[pos_mask & (x > 0.5946)] = 2
+        # 2. 对称映射逻辑
+        # 我们重新分配索引：0=0, 1=正台阶, 2=负台阶, 3=备用
         
-        # 处理负数
-        neg_mask = (~zero_mask) & (x < 0)
-        # 负数只有一个台阶，全部映射为 3 (-1.0)
-        out[neg_mask] = 3
+        # 修改后的 4 态对称方案：
+        mask_small = (~zero_mask) & (abs_x <= 0.5946)
+        mask_large = (~zero_mask) & (abs_x > 0.5946)
         
-        # 其余部分(zero_mask)已经是 0
+        out[(~zero_mask) & (x > 0)] = 1 # 正
+        out[(~zero_mask) & (x < 0)] = 2 # 负
+        
         return out
 
     def dequantize(self, q: np.ndarray) -> np.ndarray:
-        """将 0,1,2,3 还原回浮点数"""
-        # 使用查表法，速度最快且最准确
-        # index: 0    1              2    3
-        lookup = [0.0, 0.5/np.sqrt(2), 1.0, -1.0]
-        
-        # 将 numpy 数组作为索引进行映射
-        res = np.take(lookup, q)
-        return res.astype(np.float32)
+        # 索引: 0    1 (正)         2 (负)         3 (备用)
+        # 为了能量平衡，正负代表值必须绝对值相等
+        val = 0.5 # 这是一个经验值，可以根据听感调整
+        lookup = [0.0, val, -val, 0.0]
+        return np.take(lookup, q).astype(np.float32)
 
 def float_pack(bits: int, q: np.ndarray) -> bytes:
     """将量化后的整数数组打包为字节流"""

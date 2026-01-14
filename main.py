@@ -29,6 +29,29 @@ QUANT_LEVELS = {
 def warp_steep(x, k=2):
     return (x**k) / (x**k + (1-x)**k)
 
+class QFPMetaType:
+    # --- Identity (身份与曲目) ---
+    TITLE        = 0x01  # 曲目标题
+    ARTIST       = 0x02  # 演奏者/歌手 (Track Artist)
+    ALBUM_ARTIST = 0x03  # 专辑艺术家 (用于归类)
+    ALBUM        = 0x04  # 专辑名称
+    
+    # --- Context (上下文/排序) ---
+    TRACK_NUMBER = 0x05  # 曲目编号 (建议格式: "01" 或 "1/12")
+    DISC_NUMBER  = 0x06  # 碟片编号 (建议格式: "1" 或 "1/2")
+    DATE         = 0x07  # 发行日期/年份 (YYYY-MM-DD)
+    GENRE        = 0x08  # 流派
+    COMPOSER     = 0x09  # 作曲家
+    
+    # --- Media (多媒体载荷) ---
+    FRONT_COVER  = 0x10  # 封面图片 (Binary: JPG/PNG)
+    LYRICS       = 0x11  # 歌词 (UTF-8 LRC)
+    
+    # --- Tech (技术与备注) ---
+    ENCODER_VER  = 0x20  # 编码器版本
+    ENCODER_ARGS = 0x21  # 编码器参数
+    COMMENT      = 0xFF  # 备注信息
+
 class QFP3Codec:
     def __init__(self):
         self.version = 3
@@ -46,7 +69,7 @@ class QFP3Codec:
         # 强制立体声转换与填充
         if len(data.shape) == 1:
             data = np.column_stack((data, data))
-        data = data[sample_rate * 8:sample_rate * 16] # 截取 15 秒
+        data = data[sample_rate * 0:sample_rate * 15] # 截取 15 秒
         if len(data) % win_size != 0:
             padding_size = win_size - (len(data) % win_size)
             data = np.pad(data, ((0, padding_size), (0, 0)), mode='constant')
@@ -59,29 +82,48 @@ class QFP3Codec:
         for i in range(0, hop_size, band_size):
             max_freq = int((i + band_size) * nyquist / hop_size)
             # 设定基础保留比例：低频几乎全保，高频大幅削减
-            if max_freq < 4000:    quantizer_level, kr_base = 0, 2
-            elif max_freq < 6000:  quantizer_level, kr_base = 3, 1
+            if max_freq < 4000:    quantizer_level, kr_base = 0, 1
+            elif max_freq < 6000:  quantizer_level, kr_base = 3, 0.7
             elif max_freq < 8000:  quantizer_level, kr_base = 5, 1/2
             elif max_freq < 10000: quantizer_level, kr_base = 6, 1/4
-            elif max_freq < 12000: quantizer_level, kr_base = 7, 1/8
-            elif max_freq < 14000: quantizer_level, kr_base = 8, 1/16
-            elif max_freq < 16000: quantizer_level, kr_base = 9, 1/32
-            elif max_freq < 18000: quantizer_level, kr_base = 9, 1/64
+            elif max_freq < 12000: quantizer_level, kr_base = 7, 1/4
+            elif max_freq < 14000: quantizer_level, kr_base = 8, 1/6
+            elif max_freq < 16000: quantizer_level, kr_base = 9, 1/6
+            elif max_freq < 18000: quantizer_level, kr_base = 9, 1/8
             elif max_freq > 20000: quantizer_level, kr_base = 15, 0.0
-            else:                  quantizer_level, kr_base = 9, 1/128
+            else:                  quantizer_level, kr_base = 9, 1/10
             
             band_plan.append({"quantizer_level": quantizer_level, "kr_base": kr_base})
             
 
         # --- 步骤 3: 构造并保存双通道静态 Plan ---
-        lpr_plan_arr = np.array([b['quantizer_level'] for b in band_plan], dtype=np.uint8)
-        lmr_plan_arr = np.array([np.clip(lvl + 3, 0, 9) if lvl < 9 else lvl for lvl in lpr_plan_arr], dtype=np.uint8)
+        offset = 3 if qp >= 48 else 0  # 判定逻辑
+        lpr_plan_arr = np.array([min(b['quantizer_level'] + offset, 9) for b in band_plan], dtype=np.uint8)
+        lmr_plan_arr = np.array(np.where(lpr_plan_arr < 9, np.clip(lpr_plan_arr + 3, 0, 9), lpr_plan_arr), dtype=np.uint8)
         quant_levels_cache = [lpr_plan_arr, lmr_plan_arr]
 
         with open(out_file, "wb") as f:
             # 写入文件头
             f.write(self.magic + struct.pack("B", self.version))
             f.write(struct.pack("<IIII", sample_rate, win_size, num_windows, band_size))
+
+            # --- 在写入 quant_plan 之前插入 ---
+            f.write(struct.pack('B', 0x55)) # Metadata 起始符
+
+            # 示例：写入一个标题 (Type=1)
+            title_bytes = "QFPv3 Test Audio".encode('utf-8')
+            f.write(struct.pack('B', QFPMetaType.TITLE)) # Type 1: Title
+            f.write(prefix_encode(len(title_bytes))) # 使用你现有的前缀编码长度
+            f.write(title_bytes)
+
+            # 示例：写入编码器版本 (Type=2)
+            version = b"QFP-Prototype-1.0"
+            f.write(struct.pack('B', QFPMetaType.ENCODER_VER)) # Type 2: Version
+            f.write(prefix_encode(len(version)))
+            f.write(version)
+
+            f.write(struct.pack('B', 0xAA)) # Metadata 结束符
+
             # 写入 4-bit 打包后的双通道 Plan
             f.write(float_pack(4, lpr_plan_arr))
             f.write(float_pack(4, lmr_plan_arr))
@@ -123,11 +165,14 @@ class QFP3Codec:
                         # 因素 A: 频率权重 (利用你已有的 band_plan kr_base)
                         f_w = band_plan[b_idx]['kr_base']
                         
-                        # 因素 B: 精度权重 (比特数越高，通常越重要)
-                        # 也可以根据你的实验调整，比如 q_bits/8
-                        p_w = q_bits / 8.0 
+                        # 因素 B: 精度权重 (比特/空间平衡模型)
+                        # 我们希望：8-bit 桶要保住核心，2/4-bit 桶要保住覆盖面
+                        # 核心思路：
+                        # 1. 给予高位桶足够的基础权重，防止基音被砍。
+                        # 2. 缩小高低位之间的差距，让低位桶（4-bit, 2-bit）更容易通过阈值。
+                        p_w = 1 - (q_bits / 8.0) * 0.5
                         
-                        # 因素 C: QP 影响 (QP 越大，整体权重可以稍微向低频倾斜)
+                        # # 因素 C: QP 影响 (QP 越大，整体权重可以稍微向低频倾斜)
                         qp_slope = 1.0 + (qp / 64.0) * (1.0 - (b_idx / num_bands))
                         
                         weights[start:end] = f_w * p_w * qp_slope
@@ -171,7 +216,7 @@ class QFP3Codec:
                         pruned_data = np.where(mask, block_data, 0)
                         
                         # 归一化与量化逻辑
-                        scale = np.max(np.abs(pruned_data)) if np.max(np.abs(pruned_data)) > 0 else 1e-9
+                        scale = np.max(np.abs(pruned_data)) if np.max(np.abs(pruned_data)) > 0 else 1
                         norm_data = pruned_data / scale
 
                         quantizer = QUANT_LEVELS[q_lvl]['plan']
@@ -231,6 +276,26 @@ class QFP3Codec:
             # --- 步骤 5: 读取 Header 与双通道 Plan ---
             magic, version = f.read(4), struct.unpack("B", f.read(1))[0]
             sr, win_size, num_windows, band_size = struct.unpack("<IIII", f.read(16))
+
+            # --- 在解析完基础 Header 参数后 ---
+            meta_flag = struct.unpack('B', f.read(1))[0]
+            metadata = {}
+
+            if meta_flag == 0x55:
+                while True:
+                    m_type = struct.unpack('B', f.read(1))[0]
+                    if m_type == 0xAA: # 遇到停止符
+                        break
+                        
+                    # 读取变长长度
+                    m_len = prefix_decode(f) 
+                    m_data = f.read(m_len)
+                    
+                    # 根据 type 存储或处理
+                    metadata[m_type] = m_data
+                    print(f"Found Metadata Type {m_type}, Len {m_len}, Content: {m_data}")
+            else:
+                f.seek(-1, 1) # 如果不是 0x55，把字节还回去，兼容老版本
             
             hop_size = win_size // 2
             num_bands = hop_size // band_size
@@ -276,7 +341,7 @@ class QFP3Codec:
                         if band_bitmap[b_idx] == 1:
                             scale = decode_scale(frame.read(1)[0])
                             loss_byte = frame.read(1)[0]
-                            loss_val = decode_scale(loss_byte) / scale
+                            loss_val = 0 if scale == 0 else decode_scale(loss_byte) / scale
                             band_meta.append((scale, loss_val))
                     
                     # 2. 预读并恢复本通道的 4 个比特桶
@@ -381,5 +446,5 @@ class QFP3Codec:
 
 if __name__ == "__main__":
     encoder = QFP3Codec()
-    encoder.compress("寂れた浜辺(Deserted beach).wav", "test.qfp", qp=52)
+    encoder.compress("music.flac", "test.qfp", qp=32)
     encoder.decompress("test.qfp", "result.wav")
