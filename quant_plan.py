@@ -6,14 +6,7 @@ from typing import Tuple, Optional
 import numpy as np
 from typing import Optional, Tuple
 
-class QuantizePlan:
-    def __init__(self, bits: int):
-        self.bits = bits
-        
-    def __repr__(self):
-        return f"QuantizePlan(bits={self.bits})"
-
-class FloatQuantizePlan(QuantizePlan):
+class FloatQuantizePlan:
     def __init__(self, bits: int, exponent_bits: int, mantissa_bits: int, 
                  bias: Optional[int] = None, has_denormal: bool = True):
         """浮点数量化方案"""
@@ -51,11 +44,6 @@ class FloatQuantizePlan(QuantizePlan):
     
     def __repr__(self):
         return f"FloatQuantizePlan(bits={self.bits}, E{self.exponent_bits}M{self.mantissa_bits}, bias={self.bias})"
-
-class IntQuantizePlan(QuantizePlan):
-    def __init__(self, bits: int):
-        self.bits = bits
-        self.sign_bits = 1
 
 class Quantizer:
     def quantize(self, x: np.ndarray, normalized_range: float = 1.0) -> np.ndarray:
@@ -223,8 +211,7 @@ class FloatQuantizer(Quantizer):
         return val * scale
 
 class Int2BitSpecialQuantizer:
-    def __init__(self, plan=None):
-        self.plan = plan
+    def __init__(self):
         self.bits = 2
         
     def quantize(self, x: np.ndarray) -> np.ndarray:
@@ -367,8 +354,7 @@ def float_unpack(bits: int, data_bytes: bytes, count: int) -> np.ndarray:
 
 if __name__ == "__main__":
     # Test
-    plan = IntQuantizePlan(2)
-    quantizer = Int2BitSpecialQuantizer(plan)
+    quantizer = Int2BitSpecialQuantizer()
     data = 2 ** (np.random.rand(48) * 10 - 10) * np.sign(np.random.rand(48) - 0.5)
     quantized = quantizer.quantize(data)
     packed = float_pack(2, quantized)

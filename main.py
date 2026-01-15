@@ -21,7 +21,7 @@ from dsp import mdct, imdct, create_mdct_window
 from util import round_power_2
 from quant_plan import (
     FloatQuantizePlan, FloatQuantizer, float_pack, float_unpack,
-    Int2BitSpecialQuantizer, IntQuantizePlan
+    Int2BitSpecialQuantizer
 )
 from num_encoder import (
     prefix_encode, prefix_decode, pos_encode, pos_decode,
@@ -55,7 +55,7 @@ QUANT_LEVELS = {
     6:  {'bits': 4, 'plan': FloatQuantizer(FloatQuantizePlan(4, 3, 0))},
     7:  {'bits': 4, 'plan': FloatQuantizer(FloatQuantizePlan(4, 2, 1))},
     8:  {'bits': 4, 'plan': FloatQuantizer(FloatQuantizePlan(4, 1, 2))},
-    9:  {'bits': 2, 'plan': Int2BitSpecialQuantizer(IntQuantizePlan(2))},  # 最低精度
+    9:  {'bits': 2, 'plan': Int2BitSpecialQuantizer()},  # 最低精度
     15: {'bits': 0, 'plan': None}  # 跳过频段 (不编码)
 }
 
@@ -483,7 +483,7 @@ class QFP3Codec:
                         })
                         
                         # 将量化后的系数放入对应的比特桶
-                        mdct_buckets[quantizer.plan.bits].extend(quantized)
+                        mdct_buckets[q_bits].extend(quantized)
                     
                     
                     # ========================================================
@@ -842,12 +842,14 @@ class QFP3Codec:
 
 if __name__ == "__main__":
     encoder = QFP3Codec()
+
+    import sys
     
     # 压缩示例
     encoder.compress(
-        "music.flac",
+        sys.argv[1],
         "test.qfp",
-        qp=32
+        qp=41
     )
     
     # 解压示例
