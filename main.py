@@ -283,6 +283,7 @@ class QFP3Codec:
         with open(out_file, "wb") as f:
             # 4.1 写入魔数与版本号
             f.write(self.magic + struct.pack("B", self.version))
+            f.write(struct.pack("B", 0)) # Subversion
             
             # 4.2 写入核心参数
             # sample_rate: 采样率
@@ -574,6 +575,7 @@ class QFP3Codec:
             # 1.1 读取魔数与版本
             magic = f.read(4)
             version = struct.unpack("B", f.read(1))[0]
+            sub_version = struct.unpack("B", f.read(1))[0]
             
             # 1.2 读取核心参数
             sr, win_size, num_windows, band_size = struct.unpack("<IIII", f.read(16))
