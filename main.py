@@ -16,6 +16,7 @@ QFP3 音频编解码器 (Quantum Frequency Processor v3)
 """
 
 import soundfile as sf
+import sounddevice as sd
 import numpy as np
 from dsp import mdct, imdct, create_mdct_window
 from util import round_power_2
@@ -549,7 +550,7 @@ class QFP3Codec:
     # 解压方法
     # ========================================================================
     
-    def decompress(self, in_file, out_file):
+    def decompress_stream(self, in_file):
         """
         解压 QFP 文件为 WAV 音频
         
@@ -644,12 +645,18 @@ class QFP3Codec:
             # 大小: 3 * hop_size,用于存储重叠的窗口
             out_buffer = np.zeros((2, hop_size * 3), dtype=np.float32)
             
+
+            yield {
+                "sample_rate": sr,
+                "chunk_size": hop_size,
+                "length": num_windows * hop_size
+            }
             
             # ================================================================
             # 步骤 6: 逐帧解压循环
             # ================================================================
             
-            for _ in tqdm(range(num_windows), desc="解压进度"):
+            for _ in tqdm(range(num_windows), desc="解压进度", unit='frame'):
                 # 6.1 解封装帧
                 frame_bytes = decapsulate_frame(io)
                 
@@ -823,19 +830,37 @@ class QFP3Codec:
                 L_out = (out_buffer[0, :hop_size] + out_buffer[1, :hop_size]) / 2
                 R_out = (out_buffer[0, :hop_size] - out_buffer[1, :hop_size]) / 2
                 
-                # 保存当前帧
-                recon_audio.append(np.column_stack((L_out, R_out)))
+                # 输出当前帧
+                yield np.column_stack((L_out, R_out))
                 
                 # 缓冲区平移 (移除已输出部分)
                 out_buffer = np.roll(out_buffer, -hop_size, axis=1)
                 out_buffer[:, -hop_size:] = 0
             
-            
-            # ================================================================
-            # 步骤 7: 合并音频并写入文件
-            # ================================================================
-            
-            sf.write(out_file, np.concatenate(recon_audio, axis=0), sr)
+    
+    # ========================================================================
+    # 解压方法 (基于流式生成器)
+    # ========================================================================
+    
+    def decompress(self, in_file, out_file):
+        """
+        解压 QFP 文件并保存为 WAV 音频。
+        内部调用 decompress_stream，拼接所有音频块后写入文件。
+        
+        参数:
+            in_file: 输入 QFP 文件路径
+            out_file: 输出 WAV 文件路径
+        """
+        gen = self.decompress_stream(in_file)
+        info = next(gen)          # 获取基本信息
+        sr = info['sample_rate']
+        
+        chunks = []
+        for chunk in gen:
+            chunks.append(chunk)
+        
+        full_audio = np.concatenate(chunks, axis=0)
+        sf.write(out_file, full_audio, sr)
 
 
 # ============================================================================
@@ -843,16 +868,73 @@ class QFP3Codec:
 # ============================================================================
 
 if __name__ == "__main__":
+    import sys
+    import sounddevice as sd
+    from tqdm import tqdm
+
     encoder = QFP3Codec()
 
-    import sys
-    
-    # 压缩示例
-    encoder.compress(
-        sys.argv[1],
-        "test.qfp",
-        qp=41
-    )
-    
-    # 解压示例
-    encoder.decompress("test.qfp", "result.wav")
+    if len(sys.argv) < 2:
+        print("用法:")
+        print("  压缩: python qfp3.py compress <input.wav> <output.qfp> [qp]")
+        print("  解压: python qfp3.py decompress <input.qfp> <output.wav>")
+        print("  播放: python qfp3.py play <input.qfp>")
+        sys.exit(1)
+
+    cmd = sys.argv[1].lower()
+
+    if cmd == "compress":
+        if len(sys.argv) < 4:
+            print("错误: 缺少参数")
+            sys.exit(1)
+        in_file = sys.argv[2]
+        out_file = sys.argv[3]
+        qp = int(sys.argv[4]) if len(sys.argv) > 4 else 32
+        encoder.compress(in_file, out_file, qp)
+
+    elif cmd == "decompress":
+        if len(sys.argv) < 4:
+            print("错误: 缺少参数")
+            sys.exit(1)
+        in_file = sys.argv[2]
+        out_file = sys.argv[3]
+        encoder.decompress(in_file, out_file)
+        print("解压完成:", out_file)
+
+    elif cmd == "play":
+        if len(sys.argv) < 3:
+            print("错误: 缺少 QFP 文件")
+            sys.exit(1)
+        in_file = sys.argv[2]
+        gen = encoder.decompress_stream(in_file)
+        info = next(gen)
+        sr = info['sample_rate']
+        chunk_size = info['chunk_size']
+        total = info['length']
+
+        print(f"播放 {in_file}  (采样率={sr} Hz, 长度={total})")
+         # 使用 OutputStream 进行实时播放
+        stream = sd.OutputStream(
+            samplerate=sr,
+            channels=2,
+            dtype='float32',
+            blocksize=chunk_size   # 直接对齐生成器输出的帧大小
+        )
+        stream.start()
+
+        pbar = tqdm(total=total, desc="播放进度", unit="sp")
+        try:
+            for chunk in gen:
+                stream.write(chunk)
+                pbar.update(chunk_size)
+        except StopIteration:
+            pass
+        finally:
+            stream.stop()
+            stream.close()
+            pbar.close()
+        print("播放结束。")
+
+    else:
+        print("未知命令:", cmd)
+        sys.exit(1)
