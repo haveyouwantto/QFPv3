@@ -18,7 +18,7 @@ QFP3 音频编解码器 (Quantum Frequency Processor v3)
 import soundfile as sf
 import sounddevice as sd
 import numpy as np
-from dsp import mdct, imdct, create_mdct_window
+from dsp import mdct, imdct, create_mdct_window, calculate_sfm
 from util import round_power_2
 from quant_plan import (
     FloatQuantizePlan, FloatQuantizer, float_pack, float_unpack, unpack_bits_lsb,
@@ -457,6 +457,10 @@ class QFP3Codec:
                         if scale == 0:
                             scale = 1
                         norm_data = pruned_data / scale
+
+                        sfm = calculate_sfm(norm_data)
+                        if sfm > 0.37:
+                            norm_data *= 0
                         
                         # 量化
                         quantizer = QUANT_LEVELS[q_lvl]['plan']
@@ -766,12 +770,13 @@ class QFP3Codec:
                         # 反量化并恢复缩放
                         quantizer = QUANT_LEVELS[q_lvl]['plan']
                         mdct_coeff[b_idx*band_size : (b_idx+1)*band_size] = (
-                            quantizer.dequantize(q_slice) * scale * win_size
+                            quantizer.dequantize(q_slice) * scale
                         )
                         
                         # 记录损失值供噪声填充使用
                         amp_losses[b_idx] = loss_norm * scale
                     
+
                     
                     # ========================================================
                     # 6.4.5 噪声填充 (Noise Filling)
@@ -815,7 +820,7 @@ class QFP3Codec:
                     # 6.4.6 iMDCT 逆变换
                     # ========================================================
                     
-                    ch_recon[i] = imdct(mdct_coeff) * window
+                    ch_recon[i] = imdct(mdct_coeff * win_size) * window
                 
                 
                 # ============================================================

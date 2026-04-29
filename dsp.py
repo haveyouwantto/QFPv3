@@ -58,3 +58,33 @@ def imdct(x):
     t = np.arange(3*M,N2)
     y[t] = -rot[t-3*M]
     return y
+
+def calculate_sfm(mdct_slice: np.ndarray) -> float:
+    """
+    检测一段 MDCT 系数是否为噪声（使用 NumPy 加速）。
+    
+    Args:
+        mdct_slice (np.ndarray): MDCT 系数数组。
+        
+    Returns:
+        float: 谱平坦度 (SFM)。
+    """
+    # 转换为 numpy 数组（如果传入的已经是 ndarray，这一步开销极小）
+    mdct_array = np.asarray(mdct_slice)
+    
+    if mdct_array.size == 0:
+        return 0.0
+        
+    # 计算功率谱，加上小量避免数值问题
+    power = np.square(mdct_array) + 1e-12
+    
+    # 算术平均
+    arithmetic_mean = np.mean(power)
+    
+    # 几何平均 = exp(mean(log(power)))
+    geometric_mean = np.exp(np.mean(np.log(power)))
+    
+    # 谱平坦度
+    sfm = geometric_mean / arithmetic_mean
+    
+    return float(sfm)
