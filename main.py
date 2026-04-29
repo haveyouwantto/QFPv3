@@ -21,7 +21,7 @@ import numpy as np
 from dsp import mdct, imdct, create_mdct_window
 from util import round_power_2
 from quant_plan import (
-    FloatQuantizePlan, FloatQuantizer, float_pack, float_unpack,
+    FloatQuantizePlan, FloatQuantizer, float_pack, float_unpack, unpack_bits_lsb,
     Int2BitSpecialQuantizer
 )
 from num_encoder import (
@@ -683,9 +683,8 @@ class QFP3Codec:
                     
                     # 6.4.1 读取频段激活位图
                     bitmap_size = int(np.ceil(num_bands / 8))
-                    band_bitmap = np.unpackbits(
-                        np.frombuffer(frame.read(bitmap_size), dtype=np.uint8)
-                    )[:num_bands]
+                    raw_bitmap_bytes = frame.read(bitmap_size)
+                    band_bitmap = unpack_bits_lsb(raw_bitmap_bytes, num_bands)
                     
                     
                     # ========================================================
@@ -748,7 +747,10 @@ class QFP3Codec:
                         if band_bitmap[b_idx] == 0:
                             continue
                         
-                        q_bits = QUANT_LEVELS[dual_ch_plans[i][b_idx]]['bits']
+                        q_lvl = dual_ch_plans[i][b_idx]
+                        if q_lvl == 15:
+                            continue
+                        q_bits = QUANT_LEVELS[q_lvl]['bits']
                         scale, loss_norm = band_meta[meta_ptr]
                         meta_ptr += 1
                         
@@ -762,9 +764,9 @@ class QFP3Codec:
                             q_slice = np.zeros(band_size, dtype=np.uint8)
                         
                         # 反量化并恢复缩放
-                        quantizer = QUANT_LEVELS[dual_ch_plans[i][b_idx]]['plan']
+                        quantizer = QUANT_LEVELS[q_lvl]['plan']
                         mdct_coeff[b_idx*band_size : (b_idx+1)*band_size] = (
-                            quantizer.dequantize(q_slice) * scale
+                            quantizer.dequantize(q_slice) * scale * win_size
                         )
                         
                         # 记录损失值供噪声填充使用
@@ -813,7 +815,7 @@ class QFP3Codec:
                     # 6.4.6 iMDCT 逆变换
                     # ========================================================
                     
-                    ch_recon[i] = imdct(mdct_coeff * win_size) * window
+                    ch_recon[i] = imdct(mdct_coeff) * window
                 
                 
                 # ============================================================

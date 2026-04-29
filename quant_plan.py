@@ -352,6 +352,18 @@ def float_unpack(bits: int, data_bytes: bytes, count: int) -> np.ndarray:
 
     return np.array([])
 
+def unpack_bits_lsb(data_bytes, count):
+    """
+    JS unpackBits 的 Python 等价实现：
+    按字节顺序，每个字节从 LSB (bit0) 逐位读取，共 count 位。
+    """
+    out = np.zeros(count, dtype=np.uint8)
+    for i in range(count):
+        byte_idx = i // 8
+        bit_idx = i % 8
+        out[i] = (data_bytes[byte_idx] >> bit_idx) & 1
+    return out
+
 if __name__ == "__main__":
     # Test
     quantizer = Int2BitSpecialQuantizer()
