@@ -929,7 +929,7 @@ if __name__ == "__main__":
         )
         stream.start()
 
-        pbar = tqdm(total=total, desc="播放进度", unit="sp")
+        pbar = tqdm(total=total, desc="播放进度", unit="sp", mininterval=0.5)
         try:
             for chunk in gen:
                 stream.write(chunk)
